@@ -1,0 +1,251 @@
+---
+title: "Analýza determinantov srdcových ochorení"
+author: "Veronika Obmetko"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+```
+
+```{r libraries}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(lmtest)
+library(stargazer)
+library(car)
+library(pROC)
+library(margins)
+library(corrplot)
+library(ResourceSelection)
+```
+
+# Úvod a motivácia
+
+Srdcovo-cievne ochorenia predstavujú celosvetovo jednu z najčastejších príčin úmrtnosti. Cieľom tejto práce je štatisticky analyzovať dáta a lepšie pochopiť, aké klinické ukazovatele a demografické faktory najviac zvyšujú riziko ochorenia u pacientov.
+
+K dispozícii je súbor údajov obsahujúci 14 premenných: demografické údaje (vek, pohlavie) aj klinické parametre (krvný tlak, cholesterol, EKG nálezy, srdcová frekvencia, stav ciev). Hypotéza: najvýznamnejším faktorom bude kombinácia veku a stavu ciev, pričom sa overí, či sa vplyv veku líši podľa pohlavia.
+
+# 2. Načítanie a príprava údajov
+
+```{r load-data}
+df <- read_excel("data/dataset_heart.xlsx")
+
+str(df)
+head(df)
+summary(df)
+dim(df)
+
+df <- df %>%
+  mutate(target = ifelse(`heart disease` == 2, 1, 0)) %>%
+  mutate(sex = as.factor(sex),
+         `fasting blood sugar` = as.factor(`fasting blood sugar`),
+         `exercise induced angina` = as.factor(`exercise induced angina`),
+         `chest pain type` = as.factor(`chest pain type`),
+         oldpeak = as.numeric(oldpeak))
+```
+
+Dataset obsahuje medicínske dáta 270 pacientov. Cieľová premenná `target` je binárna (1 = prítomnosť ochorenia, 0 = absencia). Kategorické premenné boli prekódované na faktory, aby ich model interpretoval korektne (nie ako spojité číselné škály).
+
+# 3. Deskriptívna analýza (EDA)
+
+## Korelačná matica pre kvantitatívne premenné
+
+```{r correlation-matrix}
+df_num <- df %>% select(age, `resting blood pressure`, `serum cholestoral`, `max heart rate`, oldpeak)
+corrplot(cor(df_num, use = "complete.obs"), method = "color", type = "upper",
+         addCoef.col = "black", number.cex = 0.7)
+```
+
+Vek a srdcová frekvencia korelujú negatívne (r = -0.40) — medicínsky logické, keďže maximálna srdcová frekvencia s vekom klesá. Vek koreluje pozitívne s tlakom a cholesterolom (0.27 a 0.22). Korelácie medzi nezávislými premennými nie sú extrémne, čo naznačuje absenciu vážnej multikolinearity (potvrdené neskôr cez VIF).
+
+## Hustota rozdelenia veku podľa výskytu ochorenia
+
+```{r age-density}
+ggplot(df, aes(x = age, fill = as.factor(target))) + 
+  geom_density(alpha = 0.5) + 
+  theme_minimal() + 
+  labs(title = "Hustota rozdelenia veku podľa výskytu ochorenia",
+       x = "Vek (roky)", y = "Hustota pravdepodobnosti", fill = "Stav pacienta") + 
+  scale_fill_discrete(labels = c("0" = "Zdravý", "1" = "Chorý"))
+```
+
+Priemerný vek pacientov so srdcovým ochorením je vyšší než u zdravých pacientov, čo potvrdzuje vek ako kľúčový rizikový faktor.
+
+# 4. Modelovanie
+
+## 4.1 Lineárny pravdepodobnostný model (LPM)
+
+```{r lpm-model}
+lpm_model <- lm(target ~ age + `resting blood pressure` + `serum cholestoral`, data = df)
+summary(lpm_model)
+```
+
+`age` je štatisticky významná (p = 0.0067). R² = 0.059 je nízke — bežné pri LPM na binárnej závislej premennej.
+
+```{r heteroskedasticity-test}
+lmtest::bptest(lpm_model)
+```
+
+Breusch-Pagan test zamieta hypotézu o konštantnom rozptyle rezíduí (p < 0.05) → heteroskedasticita potvrdzuje potrebu prechodu na logistickú regresiu.
+
+## 4.1b Logit model s kvantitatívnou premennou (vek)
+
+```{r logit-age-only}
+model_quant <- glm(target ~ age, family = binomial, data = df)
+summary(model_quant)
+```
+
+```{r age-probabilities}
+vek_hodnoty <- data.frame(age = c(40, 50, 55, 60, 65))
+vek_hodnoty$pravdepodobnost <- predict(model_quant, newdata = vek_hodnoty, type = "response")
+vek_hodnoty$sanca <- vek_hodnoty$pravdepodobnost / (1 - vek_hodnoty$pravdepodobnost)
+print(vek_hodnoty)
+```
+
+```{r odds-ratio-age}
+exp(coef(model_quant))
+```
+
+## 4.2 Logit modely: Postupná špecifikácia
+
+```{r nested-models}
+model_a <- glm(target ~ age + sex, family = binomial, data = df)
+model_b <- glm(target ~ age + sex + `resting blood pressure` + `serum cholestoral`,
+                family = binomial, data = df)
+model_c <- glm(target ~ age + sex + `chest pain type` + `major vessels` + `max heart rate`,
+                family = binomial, data = df)
+model_d <- glm(target ~ age + sex + `chest pain type` + `major vessels` + oldpeak + `max heart rate`,
+                family = binomial, data = df)
+
+lrtest(model_a, model_b, model_c, model_d)
+```
+
+S pridaním klinických premenných (major vessels, chest pain type, max heart rate) sa variabilita pôvodne pripisovaná `age` presúva na tieto špecifickejšie ukazovatele — vplyv veku je mediovaný konkrétnymi fyziologickými zmenami.
+
+```{r model-comparison-table, results='asis'}
+stargazer(model_a, model_b, model_c, model_d, type = "html", keep.stat = c("n", "aic", "ll"))
+```
+
+**Model D** (finálny) má najnižšie AIC (222.2) a najvyššiu log-likelihood. Kľúčové prediktory: `major vessels` (coef 0.977), `chest pain type` kategória 4 (coef 2.407), `oldpeak` (0.732), `max heart rate` (-0.022, mierne negatívny vzťah v súlade s medicínskou logikou záťažových testov).
+
+## 4.3 Model s interakciou (age × sex)
+
+```{r interaction-model}
+model_interaction <- glm(target ~ age * sex + oldpeak, family = binomial, data = df)
+summary(model_interaction)
+```
+
+Interakčný člen `age:sex1` (coef 0.009, p = 0.799) nie je signifikantný → vplyv veku na riziko ochorenia sa medzi pohlaviami významne nelíši.
+
+# 5. Diagnostika modelu
+
+```{r vif-test}
+vif(model_d)
+```
+
+GVIF^(1/(2·Df)) sa pohybuje v rozmedzí 1.04–1.15, hlboko pod kritickou hranicou → žiadna vážna multikolinearita.
+
+```{r reset-test}
+lmtest::resettest(model_d, power = 2:3, type = "regressor")
+```
+
+RESET test (p = 0.1224) nezamieta správnu špecifikáciu modelu → nie je potrebné pridávať nelineárne transformácie.
+
+```{r link-test}
+lin_pred <- predict(model_d, type = "link")
+link_data <- data.frame(target = df$target, pred = lin_pred, pred2 = lin_pred^2)
+ltest <- glm(target ~ pred + pred2, family = binomial, data = link_data)
+summary(ltest)
+```
+
+Link test: koeficient `pred2` nevýznamný (p = 0.739) → funkčná forma modelu je správna.
+
+```{r cooks-distance}
+plot(model_d, which = 4)
+```
+
+Cookova vzdialenosť identifikuje pozorovania č. 38, 188, 211 ako relatívne vplyvné, no všetky hodnoty ostávajú hlboko pod kritickou hranicou (0.5–1.0) → model je robustný.
+
+# 6. Interpretácia a kvalita klasifikácie
+
+```{r odds-ratios}
+exp(coef(model_d))
+```
+
+- **Pohlavie** (sex1 = 5.26): šanca na ochorenie je u mužov 5.26× vyššia než u žien.
+- **Typ bolesti** (chest pain type 4 = 11.10): 11.1× vyššia šanca oproti referenčnej skupine — najsilnejší diagnostický ukazovateľ.
+- **Stav ciev** (major vessels = 2.66): každá ďalšia zablokovaná cieva zvyšuje šancu 2.66×.
+- **Oldpeak** = 2.08 (zvýšenie o 1 jednotku zvyšuje šancu 2.08×).
+- **Max heart rate** = 0.98 (zvýšenie tepu o 1/min znižuje šancu o ~2 %).
+
+```{r marginal-effects}
+mfx <- margins(model_d)
+summary(mfx)
+```
+
+Priemerné marginálne efekty (AME): pohlavie +20.6 p.b., typ bolesti 4 +33.5 p.b. (najvýraznejší vplyv), major vessels +11.6 p.b. na cievu, oldpeak +8.7 p.b., max heart rate -0.25 p.b. na úder/min.
+
+```{r confusion-matrix}
+prob <- predict(model_d, type = "response")
+class <- ifelse(prob > 0.5, 1, 0)
+table(Predicted = class, Actual = df$target)
+```
+
+Model správne klasifikoval 222 z 270 pacientov (82.2 % presnosť): 130 správne zdravých, 92 správne chorých, 20 falošne pozitívnych, 28 falošne negatívnych.
+
+```{r roc-curve}
+roc_obj <- roc(df$target, prob)
+plot(roc_obj, main = paste("ROC-krivka (AUC =", round(auc(roc_obj), 3), ")"))
+```
+
+**AUC = 0.908** — vynikajúca klasifikačná schopnosť (hodnoty nad 0.9 sa považujú za excelentné).
+
+```{r hosmer-lemeshow}
+hoslem.test(df$target, fitted(model_d), g = 10)
+```
+
+Hosmer-Lemeshow test (χ² = 4.393, df = 8, p = 0.820) potvrdzuje dobrú kalibráciu modelu.
+
+# 7. Vizualizácia S-krivky
+
+```{r s-curve}
+ggplot(df, aes(x = age, y = target)) +
+  geom_jitter(height = 0.05, alpha = 0.3) +
+  geom_smooth(method = "glm", method.args = list(family = "binomial"), color = "red") +
+  labs(title = "S-krivka: Pravdepodobnosť ochorenia podľa veku", x = "Vek", y = "Pravdepodobnosť") +
+  theme_minimal()
+```
+
+# 8. Kalibrácia modelu (skupiny pravdepodobnosti)
+
+```{r calibration}
+df$pred_prob <- prob
+df$bin <- cut(df$pred_prob, breaks = seq(0, 1, by = 0.1))
+df %>% group_by(bin) %>% summarise(mean_actual = mean(target), count = n())
+```
+
+V najvyššom decile (0.9–1.0) je skutočná miera ochorenia 95.9 %, čo presne zodpovedá predikcii modelu — vysoká miera kalibrácie naprieč rozsahom.
+
+```{r final-lrtest}
+lmtest::lrtest(model_a, model_b, model_c, model_d)
+```
+
+# Záver
+
+- **Klinické faktory dominujú nad demografickými**: vplyv veku a pohlavia sa po zahrnutí klinických indikátorov oslabuje — vek koreluje s fyziologickými zmenami, ktoré sú pre diagnózu kľúčové, nie je priamou príčinou.
+- **Kľúčové prediktory**: stav ciev (major vessels) a typ bolesti na hrudníku (chest pain type) — pacienti s najrizikovejším typom bolesti majú až 11-násobne vyššiu šancu na ochorenie.
+- **Vynikajúca predikčná schopnosť**: Model D dosahuje AUC = 0.908 a celkovú presnosť 82.2 %, je robustný, správne špecifikovaný a dobre kalibrovaný.
+- **Interakcia vek × pohlavie**: nesignifikantná — mechanizmus vzniku ochorenia z hľadiska veku je univerzálny naprieč pohlaviami.
